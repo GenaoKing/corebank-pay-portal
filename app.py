@@ -280,7 +280,7 @@ def link_de_pago(
               <p class="text-muted">Cuenta destino: <strong>{cuenta.account_no}</strong></p>
               <form id="payForm">
                 <div class="mb-3">
-                  <label class="form-label">Monto (DOP)</label>
+                  <label class="form-label">{cuenta.currency}</label>
                   <input 
                     type="number" id="amount" class="form-control"
                     min="0.01" step="0.01" placeholder="Ingresa monto" required
