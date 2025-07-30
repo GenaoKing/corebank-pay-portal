@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+qrcode
+pillow
+pydantic-settings
+sqlalchemy>=2
+pymysql
