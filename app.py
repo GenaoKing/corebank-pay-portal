@@ -14,7 +14,8 @@ from pydantic import BaseModel
 from pydantic import BaseModel, constr, Field
 from typing import Literal, Optional
 
-load_dotenv()
+if os.path.exists(".env"):
+    load_dotenv()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 DB_HOST    = os.getenv("DB_HOST")
