@@ -146,6 +146,11 @@ class PaymentLinkResponse(BaseModel):
     url: str
 
 
+@app.get("/health")
+def health():
+    # chequeo mínimo: la app está viva
+    return {"status": "ok"}
+
 
 @app.post("/payment-intents", response_model=PaymentIntentOut, status_code=201)
 def create_payment_intent(data: PaymentIntentCreate, db: Session = Depends(get_db)):
