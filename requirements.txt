@@ -5,3 +5,4 @@ pillow
 pydantic-settings
 sqlalchemy>=2
 pymysql
+qrcode[pil]
