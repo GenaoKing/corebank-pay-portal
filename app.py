@@ -145,6 +145,10 @@ class PaymentLinkResponse(BaseModel):
     slug: str
     url: str
 
+@app.get("/health")
+def health():
+    # chequeo mínimo: la app está viva
+    return {"status": "ok"}
 
 @app.get("/health")
 def health():
