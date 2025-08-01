@@ -350,8 +350,10 @@ def link_de_pago(
           document.getElementById('resultado').innerText = JSON.stringify(res, null,2);
         }});
         </script>
+	    <div style="text-align:center;">
         <h4>Escanear el codigo QR:</h4>
          <img src="data:image/png;base64,{qr_base64}" alt="QR de pago" width="220" height="220">
+		</div>
       </body>
     </html>
     """
