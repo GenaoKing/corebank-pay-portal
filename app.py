@@ -13,7 +13,7 @@ from fastapi import Request
 from pydantic import BaseModel
 from pydantic import BaseModel, constr, Field
 from typing import Literal, Optional
-import qrcode
+import qrcode,io,base64
 
 if os.path.exists(".env"):
     load_dotenv()
