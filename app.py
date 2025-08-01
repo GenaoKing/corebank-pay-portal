@@ -13,6 +13,7 @@ from fastapi import Request
 from pydantic import BaseModel
 from pydantic import BaseModel, constr, Field
 from typing import Literal, Optional
+import qrcode
 
 if os.path.exists(".env"):
     load_dotenv()
@@ -256,6 +257,11 @@ def link_de_pago(
     if not link:
         raise HTTPException(404, "Link de pago no válido")
 
+    url_pago = f"/link-de-pago?code={code}"
+    img = qrcode.make(url_pago)
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    qr_base64 = base64.b64encode(buf.getvalue()).decode()
+
     cuenta = db.query(Account).get(link.account_id)
     if not cuenta:
         raise HTTPException(404, "Cuenta destino no encontrada")
@@ -335,6 +341,8 @@ def link_de_pago(
           document.getElementById('resultado').innerText = JSON.stringify(res, null,2);
         }});
         </script>
+        <h4>Escanear el codigo QR:</h4>
+         <img src="data:image/png;base64,{qr_base64}" alt="QR de pago" width="220" height="220">
       </body>
     </html>
     """
