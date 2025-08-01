@@ -34,7 +34,7 @@ class Transaction(Base):
     __tablename__ = "transaction_"
     id               = Column(CHAR(36), primary_key=True)
     created_at       = Column(DateTime, default=datetime.utcnow, nullable=False)
-    type             = Column(String(32), nullable=False)         # 'TRANSFER','CARD_PAYMENT',...
+    type             = Column(String(32), nullable=False)
     currency         = Column(CHAR(3), nullable=False)
     amount_minor     = Column(BigInteger, nullable=False)
     from_account_id  = Column(CHAR(36))
@@ -229,14 +229,15 @@ def link_de_pago(
     <p>Pago a: {nombre}</p>
 
     <!--  FORMULARIO  -->
-    <form>
+    <form action='/link-de-pago' method='get'>
+      <input type='hidden' name='code' value='{code}'>
       <label>Número de tarjeta</label><br>
-      <input type="text" name="card_number"><br>
+      <input type='text' name='card_number'><br>
       <label>Mes</label><br>
-      <input type="text" name="exp_month"><br>
+      <input type='text' name='exp_month'><br>
       <label>Año</label><br>
-      <input type="text" name="exp_year"><br><br>
-      <button type="submit">Pagar</button>
+      <input type='text' name='exp_year'><br><br>
+      <button type='submit'>Pagar</button>
     </form>
 
     <!--  QR justo debajo  -->
@@ -244,3 +245,4 @@ def link_de_pago(
     <img src="data:image/png;base64,{qr_base64}" alt="QR de pago" width="220" height="220">
     """
     return HTMLResponse(html)
+
