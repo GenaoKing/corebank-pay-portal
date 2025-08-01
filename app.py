@@ -1,248 +1,293 @@
-import os, io, base64
+"""
+CoreBank – Portal de links de pago
+Requisitos: FastAPI, SQLAlchemy 2, Uvicorn, Gunicorn, Pydantic, PyMySQL
+"""
+
+import os
+import secrets
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from uuid import uuid4
-from datetime import datetime
-from typing import Optional
 
-import qrcode
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Query, Request
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, constr, Field
-from sqlalchemy import (
-    create_engine, Column, String, CHAR, DateTime,
-    BigInteger, ForeignKey, Integer
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, PositiveFloat, constr
+from sqlalchemy import (Boolean, CheckConstraint, Column, DateTime, Enum, ForeignKey,
+                        Numeric, String, create_engine, select)
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, declarative_base, mapped_column
+
+# ---------------------------------------------------------------------------
+#  Configuración de base de datos
+# ---------------------------------------------------------------------------
+
+DB_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///./dev.db"
+)  # Ejemplo Azure: mysql+pymysql://user:pass@server.mysql.database.azure.com/db
+
+connect_args = {}
+if DB_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+elif DB_URL.startswith("mysql+pymysql"):
+    # TLS usando el CA de la imagen de App Service
+    connect_args = {"ssl": {"ca": "/etc/ssl/certs/ca-certificates.crt"}}
+
+engine = create_engine(
+    DB_URL,
+    future=True,
+    echo=False,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+    pool_recycle=300,
 )
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
-# ─── Config ─────────────────────────────────────────────────────────────
-if os.path.exists(".env"):
-    load_dotenv()
-
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASSWORD")
-DB_SSL_CA = os.getenv("DB_SSL_CA")
-
-DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}?charset=utf8mb4"
-engine = create_engine(DATABASE_URL, connect_args={"ssl": {"ca": DB_SSL_CA}})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = Session(bind=engine, autoflush=False, future=True)
 Base = declarative_base()
 
-# ─── Models ─────────────────────────────────────────────────────────────
-class Transaction(Base):
-    __tablename__ = "transaction_"
-    id               = Column(CHAR(36), primary_key=True)
-    created_at       = Column(DateTime, default=datetime.utcnow, nullable=False)
-    type             = Column(String(32), nullable=False)
-    currency         = Column(CHAR(3), nullable=False)
-    amount_minor     = Column(BigInteger, nullable=False)
-    from_account_id  = Column(CHAR(36))
-    to_account_id    = Column(CHAR(36))
-    status           = Column(String(16), nullable=False)
-    ref_external     = Column(String(64))
-    message          = Column(String(255))
+# ---------------------------------------------------------------------------
+#  Modelos
+# ---------------------------------------------------------------------------
 
-class Card(Base):
-    __tablename__ = "card"
-    id         = Column(CHAR(36), primary_key=True)
-    party_id   = Column(CHAR(36), nullable=False)
-    account_id = Column(CHAR(36), nullable=False)
-    brand      = Column(String(16), nullable=False)
-    pan        = Column(String(32), nullable=False)
-    pan_last4  = Column(CHAR(4), nullable=False)
-    exp_month  = Column(Integer, nullable=False)
-    exp_year   = Column(Integer, nullable=False)
-    status     = Column(String(16), default="ACTIVE", nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+
+class AccountType(str, Enum):
+    SAVINGS = "savings"
+    CREDIT = "credit"
+
 
 class Account(Base):
-    __tablename__ = "account"
-    id            = Column(CHAR(36), primary_key=True)
-    party_id      = Column(CHAR(36), ForeignKey("party.id"), nullable=False)
-    account_no    = Column(String(32), unique=True, nullable=False)
-    currency      = Column(CHAR(3), nullable=False)
-    status        = Column(String(16), default="ACTIVE", nullable=False)
-    balance_minor = Column(BigInteger, default=0, nullable=False)
-    created_at    = Column(DateTime, default=datetime.utcnow)
+    __tablename__ = "accounts"
 
-    party = relationship("Party", back_populates="accounts")
+    id: str = mapped_column(String(64), primary_key=True)
+    type: AccountType = mapped_column(Enum(AccountType))
+    balance: Decimal = mapped_column(Numeric(18, 2), default=Decimal("0.00"))
+    credit_limit: Decimal = mapped_column(Numeric(18, 2), default=Decimal("0.00"))
+    available_credit: Decimal = mapped_column(Numeric(18, 2), default=Decimal("0.00"))
+
+
+class PaymentIntentStatus(str, Enum):
+    REQUIRES_PAYMENT = "REQUIRES_PAYMENT"
+    CAPTURED = "CAPTURED"
+
 
 class PaymentIntent(Base):
-    __tablename__ = "payment_intent"
-    id            = Column(CHAR(36), primary_key=True)
-    account_id    = Column(CHAR(36), nullable=False)
-    amount_minor  = Column(BigInteger, nullable=False)
-    currency      = Column(CHAR(3), default="DOP", nullable=False)
-    status        = Column(String(32), default="REQUIRES_PAYMENT", nullable=False)
-    description   = Column(String(255))
-    created_at    = Column(DateTime, default=datetime.utcnow)
-    updated_at    = Column(DateTime, onupdate=datetime.utcnow)
+    __tablename__ = "payment_intents"
 
-class Party(Base):
-    __tablename__ = "party"
-    id        = Column(CHAR(36), primary_key=True)
-    full_name = Column(String(160), nullable=False)
-    accounts  = relationship("Account", back_populates="party")
+    id: str = mapped_column(String(36), primary_key=True)
+    dest_account_id: str = mapped_column(ForeignKey("accounts.id"))
+    amount: Decimal = mapped_column(Numeric(18, 2))
+    currency: str = mapped_column(String(3), default="DOP")
+    status: PaymentIntentStatus = mapped_column(Enum(PaymentIntentStatus))
+    created_at: datetime = mapped_column(DateTime, default=datetime.utcnow)
+
 
 class Paylink(Base):
-    __tablename__ = "paylink"
-    id               = Column(CHAR(36), primary_key=True)
-    account_id       = Column(CHAR(36), nullable=False)
-    payment_intent_id= Column(CHAR(36))
-    kind             = Column(String(8), nullable=False)          # 'URL'
-    slug             = Column(String(64), unique=True, nullable=False)
-    expires_at       = Column(DateTime)
-    created_at       = Column(DateTime, default=datetime.utcnow)
+    __tablename__ = "paylinks"
 
-# ─── FastAPI ────────────────────────────────────────────────────────────
-app = FastAPI(title="Portal de Pago")
+    slug: str = mapped_column(String(32), primary_key=True)
+    payment_intent_id: str = mapped_column(ForeignKey("payment_intents.id"))
+    expires_at: datetime = mapped_column(DateTime)
+    used: bool = mapped_column(Boolean, default=False)
+    created_at: datetime = mapped_column(DateTime, default=datetime.utcnow)
 
-def get_db():
-    db = SessionLocal()
+
+# ---------------------------------------------------------------------------
+#  App FastAPI
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="CoreBank Pay-Portal")
+
+
+@app.on_event("startup")
+def _create_schema_if_needed():
     try:
-        yield db
-    finally:
-        db.close()
+        Base.metadata.create_all(engine)
+    except OperationalError as exc:
+        # No tumbamos la app si la DB no está lista (útil al arrancar en Azure).
+        import traceback
 
-# ─── Schemas ────────────────────────────────────────────────────────────
-class PaymentIntentCreate(BaseModel):
-    account_no: constr(min_length=1, max_length=32)
-    amount_minor: int = Field(gt=0)
-    description: Optional[str] = None
+        traceback.print_exc()
 
-class PaymentIntentOut(BaseModel):
-    id: str
-    status: str
 
-class ConfirmPayment(BaseModel):
-    card_number: constr(min_length=12, max_length=19)
-    exp_month: int
-    exp_year: int
+# ----------------------------- Utilidades ----------------------------------
 
-class PaymentLinkResponse(BaseModel):
-    slug: str
-    url: str
 
-# ─── Endpoints ──────────────────────────────────────────────────────────
-@app.post("/payment-intents", response_model=PaymentIntentOut, status_code=201)
-def create_payment_intent(data: PaymentIntentCreate, db: Session = Depends(get_db)):
-    acct = db.query(Account).filter_by(account_no=data.account_no).first()
-    if not acct:
-        raise HTTPException(404, "Cuenta no encontrada")
+def money(value: float | Decimal) -> Decimal:
+    return Decimal(value).quantize(Decimal("0.01"), ROUND_HALF_UP)
 
-    pi = PaymentIntent(
-        id=str(uuid4()),
-        account_id=acct.id,
-        amount_minor=data.amount_minor,
-        currency=acct.currency,
-        description=data.description,
-    )
-    db.add(pi); db.commit()
-    return {"id": pi.id, "status": pi.status}
 
-@app.post("/payment-intents/{pi_id}/confirm", response_model=PaymentIntentOut)
-def confirm_payment(pi_id: str, data: ConfirmPayment, db: Session = Depends(get_db)):
-    pi = db.query(PaymentIntent).get(pi_id)
-    if not pi:
-        raise HTTPException(404, "Intento no encontrado")
+def get_account(session: Session, acc_id: str) -> Account:
+    obj = session.get(Account, acc_id)
+    if not obj:
+        raise HTTPException(404, f"Cuenta no encontrada: {acc_id}")
+    return obj
 
-    if pi.status != "REQUIRES_PAYMENT":
-        return {"id": pi.id, "status": pi.status}
 
-    card = (
-        db.query(Card)
-        .filter_by(
-            pan=data.card_number,
-            exp_month=data.exp_month,
-            exp_year=data.exp_year,
-            status="ACTIVE",
+# ---------------------------------------------------------------------------
+#  Schemas Pydantic
+# ---------------------------------------------------------------------------
+
+AccountId = constr(min_length=1, max_length=64, strip_whitespace=True)
+
+
+class LinkRequest(BaseModel):
+    cuenta_destino: AccountId
+    monto: PositiveFloat
+
+
+class TransferRequest(BaseModel):
+    cuenta_origen: AccountId
+    cuenta_destino: AccountId
+    monto: PositiveFloat
+
+
+# ---------------------------------------------------------------------------
+#  Endpoints públicos
+# ---------------------------------------------------------------------------
+
+
+@app.post("/create-payment-link")
+def create_payment_link(data: LinkRequest):
+    """Crea PaymentIntent + Paylink y devuelve URL."""
+    amount = money(data.monto)
+
+    with SessionLocal.begin() as db:
+        dest = get_account(db, data.cuenta_destino)
+
+        # 1) PaymentIntent
+        pi = PaymentIntent(
+            id=str(uuid4()),
+            dest_account_id=dest.id,
+            amount=amount,
+            status=PaymentIntentStatus.REQUIRES_PAYMENT,
         )
-        .first()
-    )
-    if not card:
-        pi.status = "FAILED"; db.commit()
-        raise HTTPException(422, "Tarjeta declinada")
+        db.add(pi)
 
-    from_account = db.query(Account).get(card.account_id)
-    to_account   = db.query(Account).get(pi.account_id)
+        # 2) Link con slug aleatorio 32 caracteres válido 30 min
+        slug = secrets.token_urlsafe(16)
+        link = Paylink(
+            slug=slug,
+            payment_intent_id=pi.id,
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+        )
+        db.add(link)
 
-    if from_account.balance_minor < pi.amount_minor:
-        pi.status = "FAILED"; db.commit()
-        raise HTTPException(422, "Fondos insuficientes")
+    return {
+        "link": f"/link-de-pago/{slug}",
+        "payment_intent_id": pi.id,
+        "expires_at": link.expires_at.isoformat(),
+    }
 
-    from_account.balance_minor -= pi.amount_minor
-    to_account.balance_minor   += pi.amount_minor
 
-    tx = Transaction(
-        id=str(uuid4()),
-        type="CARD_PAYMENT",
-        currency=pi.currency,
-        amount_minor=pi.amount_minor,
-        from_account_id=from_account.id,
-        to_account_id=to_account.id,
-        status="POSTED",
-    )
-    db.add(tx); pi.status = "CAPTURED"; db.commit()
-    return {"id": pi.id, "status": pi.status}
+@app.get("/link-de-pago/{slug}", response_class=HTMLResponse)
+def show_link(slug: str):
+    """Página HTML con formulario de pago."""
+    with SessionLocal() as db:
+        link = db.get(Paylink, slug)
+        if not link or link.used or link.expires_at < datetime.utcnow():
+            raise HTTPException(404, "Link inválido o expirado")
 
-@app.post(
-    "/accounts/{account_no}/payment-link",
-    response_model=PaymentLinkResponse,
-    status_code=201,
-)
-def create_payment_link(account_no: str, request: Request, db: Session = Depends(get_db)):
-    cuenta = db.query(Account).filter_by(account_no=account_no).first()
-    if not cuenta:
-        raise HTTPException(404, "Cuenta no encontrada")
-
-    slug = f"pl-{uuid4().hex[:8]}"
-    link = Paylink(id=str(uuid4()), account_id=cuenta.id, kind="URL", slug=slug)
-    db.add(link); db.commit()
-
-    url_pago = f"{request.url_for('link_de_pago')}?code={slug}"
-    return PaymentLinkResponse(slug=slug, url=url_pago)
-
-@app.get("/link-de-pago", response_class=HTMLResponse)
-def link_de_pago(
-    code: str = Query(..., description="Código corto del enlace de pago"),
-    db: Session = Depends(get_db),
-):
-    link = db.query(Paylink).filter_by(slug=code).first()
-    if not link:
-        raise HTTPException(404, "Link de pago no válido")
-
-    cuenta = db.query(Account).get(link.account_id)
-    if not cuenta:
-        raise HTTPException(404, "Cuenta destino no encontrada")
-
-    # —— Generar QR como data-URI ——————————————————————————
-    url_pago = f"/link-de-pago?code={code}"
-    img = qrcode.make(url_pago)
-    buf = io.BytesIO(); img.save(buf, format="PNG")
-    qr_base64 = base64.b64encode(buf.getvalue()).decode()
-
-    nombre = cuenta.party.full_name if cuenta.party else "Titular"
+        pi = db.get(PaymentIntent, link.payment_intent_id)
 
     html = f"""
-    <h3>Pagar a {cuenta.account_no}</h3>
-    <p>Pago a: {nombre}</p>
-
-    <!--  FORMULARIO  -->
-    <form action='/link-de-pago' method='get'>
-      <input type='hidden' name='code' value='{code}'>
-      <label>Número de tarjeta</label><br>
-      <input type='text' name='card_number'><br>
-      <label>Mes</label><br>
-      <input type='text' name='exp_month'><br>
-      <label>Año</label><br>
-      <input type='text' name='exp_year'><br><br>
-      <button type='submit'>Pagar</button>
-    </form>
-
-    <!--  QR justo debajo  -->
-    <h4>También puedes escanear el QR:</h4>
-    <img src="data:image/png;base64,{qr_base64}" alt="QR de pago" width="220" height="220">
+    <!doctype html>
+    <html><head><title>Link de pago</title></head>
+    <body>
+      <h2>Pagar {pi.amount} {pi.currency}</h2>
+      <p>Cuenta destino: <strong>{pi.dest_account_id}</strong></p>
+      <form action="/payment-intents/{pi.id}/confirm" method="post">
+        Cuenta origen:<br>
+        <input name="cuenta_origen" required><br><br>
+        <button type="submit">Pagar</button>
+      </form>
+      <small>Válido hasta {link.expires_at:%Y-%m-%d %H:%M:%S UTC}</small>
+    </body></html>
     """
     return HTMLResponse(html)
+
+
+@app.post("/payment-intents/{pi_id}/confirm")
+def confirm_payment_intent(
+    pi_id: str,
+    cuenta_origen: str = Form(...),
+):
+    with SessionLocal.begin() as db:
+        pi = db.get(PaymentIntent, pi_id)
+        if not pi:
+            raise HTTPException(404, "PaymentIntent no encontrado")
+        if pi.status == PaymentIntentStatus.CAPTURED:
+            return {"status": "ok", "message": "Ya estaba pagado"}
+
+        link_stmt = select(Paylink).where(Paylink.payment_intent_id == pi_id)
+        link = db.scalars(link_stmt).first()
+        if not link or link.used or link.expires_at < datetime.utcnow():
+            raise HTTPException(400, "Link inválido o expirado")
+
+        origin = get_account(db, cuenta_origen)
+        dest = get_account(db, pi.dest_account_id)
+        amount = pi.amount
+
+        # Reglas de débito / crédito muy simplificadas
+        if origin.type == AccountType.SAVINGS:
+            if origin.balance < amount:
+                raise HTTPException(400, "Fondos insuficientes")
+            origin.balance -= amount
+        else:  # credit
+            if origin.available_credit < amount:
+                raise HTTPException(400, "Crédito insuficiente")
+            origin.available_credit -= amount
+
+        if dest.type == AccountType.SAVINGS:
+            dest.balance += amount
+        else:
+            dest.available_credit = min(
+                dest.credit_limit, dest.available_credit + amount
+            )
+
+        pi.status = PaymentIntentStatus.CAPTURED
+        link.used = True
+
+    # Redirige a página de éxito
+    return RedirectResponse(url=f"/exito/{pi.id}", status_code=303)
+
+
+@app.get("/exito/{pi_id}", response_class=HTMLResponse)
+def payment_success(pi_id: str):
+    return HTMLResponse(
+        f"<h3>¡Pago realizado!</h3><p>ID de transacción: {pi_id}</p>"
+    )
+
+
+@app.post("/transfer")
+def transfer(data: TransferRequest):
+    """Endpoint usado por la app móvil/portal (fuera del flujo de links)."""
+    amount = money(data.monto)
+
+    with SessionLocal.begin() as db:
+        o = get_account(db, data.cuenta_origen)
+        d = get_account(db, data.cuenta_destino)
+
+        if o.id == d.id:
+            raise HTTPException(400, "Cuentas iguales")
+
+        if o.type == AccountType.SAVINGS:
+            if o.balance < amount:
+                raise HTTPException(400, "Fondos insuficientes")
+            o.balance -= amount
+        else:
+            if o.available_credit < amount:
+                raise HTTPException(400, "Crédito insuficiente")
+            o.available_credit -= amount
+
+        if d.type == AccountType.SAVINGS:
+            d.balance += amount
+        else:
+            d.available_credit = min(d.credit_limit, d.available_credit + amount)
+
+    return {"status": "ok"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
